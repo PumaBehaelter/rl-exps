@@ -13,6 +13,7 @@ from trl import GRPOConfig, GRPOTrainer
 from pm4py.objects.powl.obj import StrictPartialOrder, OperatorPOWL, Transition, SilentTransition
 from pm4py.objects.process_tree.obj import Operator
 from typing import List, Dict
+from ollama import chat, ChatResponse
 
 # ---------------------------------------------------------------------------#
 # 1. Configuration & Hyperparameters                                          #
@@ -25,8 +26,8 @@ if torch.cuda.is_available():
 
 # --- Directory and Model Configuration ---
 TRAIN_DATA_DIR = "training"
-MODEL_NAME = "Qwen/Qwen2.5-Coder-3B"
-OUTPUT_DIR = "grpo_qwen_powl_generator_openai_reward"
+MODEL_NAME = "Qwen/Qwen2.5-Coder-0.5B-Instruct" # The Model is to large for 4 GB V ram"Qwen/Qwen2.5-Coder-3B"
+OUTPUT_DIR = "grpo_qwen_powl_generator_ollama_reward"
 
 # --- Training Hyperparameters ---
 MAX_PROMPT_TOKENS = 4096
@@ -43,9 +44,9 @@ MAX_DATASET_SAMPLES = 500
 LOGGING_STEPS = 1
 SAVE_STEPS = 100
 
-# --- OpenAI API Configuration ---
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = "gpt-4.1-mini"
+# --- OLLAMA Configuration ---
+# NOTE: Ensure Ollama is running and you have pulled this model: ollama pull qwen2:7b-instruct
+OLLAMA_MODEL = "gpt-oss:120b-cloud"
 
 
 # ---------------------------------------------------------------------------#
@@ -121,9 +122,9 @@ dataset = load_limited_dataset(TRAIN_DATA_DIR, max_samples=MAX_DATASET_SAMPLES)
 # 3. NEW REWARD FUNCTION (using OpenAI API)                                   #
 # ---------------------------------------------------------------------------#
 
-def get_openai_grading_prompt(original_prompt: str, completions: List[str]) -> str:
+def get_ollama_grading_prompt(original_prompt: str, completions: List[str]) -> str:
     """
-    Creates the prompt for the OpenAI grading model.
+    Creates the prompt for the Ollama grading model.
     """
     prompt_intro = f"""
 You are an expert in process modeling. Your task is to evaluate Python code snippets that generate POWL models based on a given prompt.
@@ -165,10 +166,9 @@ Now, provide the JSON output for the responses above.
     return prompt_intro + responses_section + prompt_outro
 
 
-def openai_grading_reward_function(completions: List[str], **kwargs) -> List[float]:
+def ollama_grading_reward_function(completions: List[str], **kwargs) -> List[float]:
     """
-    Calculates rewards by getting grades from the OpenAI API.
-    """
+    Calculates rewards by getting grades from the local Ollama model (The Judge).    """
     BAD_REWARD = -1.0
 
     # --- FIX ---
@@ -183,47 +183,48 @@ def openai_grading_reward_function(completions: List[str], **kwargs) -> List[flo
         print("ERROR: Could not find 'prompts' key in kwargs. Unable to create grading prompt.")
         return [BAD_REWARD] * len(completions)
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("ERROR: OPENAI_API_KEY environment variable not set.")
-        return [BAD_REWARD] * len(completions)
+    # Note: Using get_ollama_grading_prompt now
+    grading_prompt = get_ollama_grading_prompt(original_prompt, completions)
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    grading_prompt = get_openai_grading_prompt(original_prompt, completions)
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [{"role": "user", "content": grading_prompt}],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.0
-    }
-
+    
+    print("Start Response:")
+    # --- Ollama Call ---
+    response: ChatResponse = chat(
+        model=OLLAMA_MODEL, 
+        messages=[
+            {
+                "role": "user", 
+                "content": grading_prompt,
+            },
+        ],
+        
+    )
     try:
-        response = requests.post(OPENAI_API_URL, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-
-        response_data = response.json()
-        grades_str = response_data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        if isinstance(response, dict) and 'message' in response and 'content' in response['message']:
+            grades_str = response['message']['content']
+        elif hasattr(response, 'message') and hasattr(response.message, 'content'):
+            grades_str = response.message.content
+        else:
+            # Fallback oder Fehlerbehandlung, falls die Struktur unerwartet ist
+            print(f"ERROR: Unexpected Ollama response structure: {response}")
+            return [BAD_REWARD] * len(completions)
+        
+        print(type(grades_str), grades_str)
         grades_json = json.loads(grades_str)
+        print("After type: ", grades_json)
         grades = grades_json.get("grades")
 
         if grades is None or not isinstance(grades, list) or len(grades) != len(completions):
-            print(f"ERROR: OpenAI response was malformed. Received: {grades_str}")
+            print(f"ERROR: Ollama response was malformed. Received: {grades_str}")
             return [BAD_REWARD] * len(completions)
 
-        # --- MODIFIED --- Print grades obtained in the current iteration
+        # Print grades obtained in the current iteration
         print(f"--- GRADES FOR STEP: {grades} ---")
         return [float(g) for g in grades]
 
-    except requests.RequestException as e:
-        print(f"ERROR: OpenAI API request failed: {e}")
-        return [BAD_REWARD] * len(completions)
-    except (json.JSONDecodeError, KeyError, TypeError, IndexError) as e:
-        print(f"ERROR: Failed to parse OpenAI response: {e}. Response text: {response.text}")
+    except Exception as e:
+        # Catch any general exception (Ollama connection error, JSON parsing error)
+        print(f"ERROR: Failed to get/parse Ollama response (Is Ollama running? Is the model loaded?): {e}")
         return [BAD_REWARD] * len(completions)
 
 
@@ -267,7 +268,14 @@ training_args = GRPOConfig(
     max_completion_length=MAX_COMPLETION_TOKENS,
     num_generations=NUM_GENERATIONS,
     remove_unused_columns=False,
-    bf16=True,
+    
+    # --- FIX STARTS HERE ---
+    bf16=False, 
+    fp16=True,                  # ENABLE THIS (see step 2 below)
+    dataloader_pin_memory=False, # Fixes the specific warning
+    dataloader_num_workers=0,    # Fixes the hang on Windows
+    # --- FIX ENDS HERE ---
+    
     logging_steps=LOGGING_STEPS,
     save_steps=SAVE_STEPS,
     report_to="none",
@@ -277,14 +285,14 @@ trainer = GRPOTrainer(
     model=model,
     args=training_args,
     train_dataset=dataset,
-    reward_funcs=[openai_grading_reward_function],
+    reward_funcs=[ollama_grading_reward_function],
 )
 
 # ---------------------------------------------------------------------------#
 # 5. Training Execution                                                       #
 # ---------------------------------------------------------------------------#
 
-print("\n--- Starting GRPO Training with OpenAI-based Rewards ---")
+print("\n--- Starting GRPO Training with Ollama-based Rewards ---")
 print(f"Logging diagnostics every {LOGGING_STEPS} steps.")
 print(f"Saving model checkpoint every {SAVE_STEPS} steps.")
 print("Look for 'loss', 'rewards/chosen', 'rewards/rejected', and 'GRADES FOR STEP' in the logs below.")
