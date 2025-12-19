@@ -3,6 +3,7 @@
 import os
 import json
 import random
+import winreg
 import torch
 import pm4py
 import re
@@ -13,7 +14,7 @@ from trl import GRPOConfig, GRPOTrainer
 from pm4py.objects.powl.obj import StrictPartialOrder, OperatorPOWL, Transition, SilentTransition
 from pm4py.objects.process_tree.obj import Operator
 from typing import List, Dict
-from ollama import chat, ChatResponse
+from ollama import Client ,chat, ChatResponse
 
 # ---------------------------------------------------------------------------#
 # 1. Configuration & Hyperparameters                                          #
@@ -166,6 +167,25 @@ Now, provide the JSON output for the responses above.
     return prompt_intro + responses_section + prompt_outro
 
 
+
+'HELPER TO GET OLLAMA API KEY FROM ENV OR REGISTRY on WINDOWS'
+def get_ollama_key():
+    # 1. Try the standard way first
+    key = os.environ.get('OLLAMA_API_KEY')
+    if key:
+        return key
+
+    # 2. Fallback: Read directly from Windows Registry if os.environ fails
+    try:
+        reg_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment')
+        value, _ = winreg.QueryValueEx(reg_key, 'OLLAMA_API_KEY')
+        winreg.CloseKey(reg_key)
+        return value
+    except Exception:
+        return None
+
+
+
 def ollama_grading_reward_function(completions: List[str], **kwargs) -> List[float]:
     """
     Calculates rewards by getting grades from the local Ollama model (The Judge).    """
@@ -186,10 +206,15 @@ def ollama_grading_reward_function(completions: List[str], **kwargs) -> List[flo
     # Note: Using get_ollama_grading_prompt now
     grading_prompt = get_ollama_grading_prompt(original_prompt, completions)
 
-    
+    api_key = get_ollama_key()
+
     print("Start Response:")
     # --- Ollama Call ---
-    response: ChatResponse = chat(
+    client = Client(
+        host="https://ollama.com",  # Standard Ollama host
+        headers={"Authorization": 'Bearer ' + api_key}  # If using API key authentication
+    )
+    response: ChatResponse = client.chat(
         model=OLLAMA_MODEL, 
         messages=[
             {
